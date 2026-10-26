@@ -13,8 +13,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from sklearn.inspection import permutation_importance
-
 from predictor import (CHECKPOINTS, FEATURES, History, build_live_row, predict_range,
                        train_models)
 
@@ -735,26 +733,6 @@ with tab_real:
 # ---------------------------------------------------------------------
 # tab 4: inside the model
 # ---------------------------------------------------------------------
-FEATURE_GROUPS = [
-    ('The MES plan', '#526860',
-     ['ordered_qty', 'plan_work_h', 'plan_cycle_s', 'plan_setup_h', 'priority',
-      'mes_remaining_h']),
-    ('Progress so far', '#0A926F',
-     ['pct_of_ordered', 'pieces_done', 'remaining_pieces', 'worked_h', 'obs_cycle_s',
-      'elapsed_wall_h', 'wall_work_frac', 'waste_rate']),
-    ('Day and hour', '#9AA5B1', ['dow', 'hour']),
-    ('Article history', '#E08A1E',
-     ['art_n_past', 'art_cycle_s', 'art_med_work_h', 'art_plan_bias']),
-    ('Machine history', '#2E6DA4',
-     ['mach_n_past', 'mach_cycle_s', 'mach_med_work_h', 'mach_plan_bias', 'wc_id']),
-    ('Alarms', '#C0392B', ['alarms_7d', 'alarm_h_7d', 'alarms_30d', 'alarm_h_30d']),
-    ('Comparisons and ready-made estimates', '#8E5BB5',
-     ['obs_vs_plan', 'obs_vs_art', 'obs_vs_mach', 'plan_vs_art', 'plan_vs_mach',
-      'est_from_obs_h', 'est_from_art_h', 'est_from_mach_h',
-      'est_plan_x_mach_bias', 'est_plan_x_art_bias']),
-]
-
-
 FEATURE_WORDS = {
     'ordered_qty': 'pieces ordered', 'plan_work_h': 'planned working hours',
     'plan_cycle_s': 'planned seconds per piece', 'plan_setup_h': 'planned setup hours',
@@ -805,25 +783,26 @@ def boosting_internals():
         if not is_category:
             tree_columns.append(feature)
 
-    # the log-correction after 1, 2, ... all trees, for every test row
-    staged = np.array(list(model.staged_predict(X)))
-    plan = test_rows['mes_remaining_h'].clip(lower=0.05).values
-    denominator = test_rows['target_h'].clip(lower=0.5).values
-    error_by_trees = []
-    for stage in staged:
-        hours = plan * np.exp(stage)
-        error_by_trees.append(float(np.mean(np.abs(hours - test_rows['target_h'].values)
-                                            / denominator) * 100))
+    trees = [tree[0] for tree in model._predictors]
+
+    # how many times each input is used as a question, in all the trees
+    questions = {}
+    for tree in trees:
+        for node in tree.nodes:
+            if not node['is_leaf']:
+                feature = tree_columns[node['feature_idx']]
+                questions[feature] = questions.get(feature, 0) + 1
 
     return {
         'model': model,
-        'trees': [tree[0] for tree in model._predictors],
+        'trees': trees,
         'start': float(model._baseline_prediction.ravel()[0]),
         'tree_columns': tree_columns,
         'machines': list(model._preprocessor.named_transformers_['encoder'].categories_[0]),
         'encoded': model._preprocessor.transform(X),
-        'staged': staged,
-        'error_by_trees': error_by_trees,
+        # the log-correction after 1, 2, ... all trees, for every test row
+        'staged': np.array(list(model.staged_predict(X))),
+        'questions': questions,
         'can_be_empty': set(feature for feature in FEATURES if X[feature].isna().any()),
     }
 
@@ -937,246 +916,163 @@ def tree_picture(tree, internals, path, whole_tree):
     return '\n'.join(lines)
 
 
-def group_of(feature):
-    for name, colour, features in FEATURE_GROUPS:
-        if feature in features:
-            return name, colour
-    return 'other', '#9AA5B1'
-
-
-@st.cache_resource(show_spinner='Measuring which inputs matter most...')
-def feature_importance():
-    """Permutation importance of the p50 model on the test rows.
-
-    Each input is shuffled in turn; the more the error grows, the more the
-    model relies on that input.
-    """
-    test_rows = data['test_rows']
-    plan = test_rows['mes_remaining_h'].clip(lower=0.05)
-    real = test_rows['target_h'].clip(lower=0.05)
-    target = np.log(real / plan)
-    model = data['models']['p50']
-    baseline = float(np.mean(np.abs(model.predict(test_rows[FEATURES]) - target)))
-    shuffled = permutation_importance(model, test_rows[FEATURES], target,
-                                      scoring='neg_mean_absolute_error',
-                                      n_repeats=5, random_state=42)
-    rows = []
-    for index, feature in enumerate(FEATURES):
-        group, colour = group_of(feature)
-        rows.append({'feature': feature, 'group': group, 'colour': colour,
-                     'growth_pct': shuffled.importances_mean[index] / baseline * 100})
-    return pd.DataFrame(rows).sort_values('growth_pct', ascending=False)
-
-
 with tab_model:
-    result = meta['result']
-    test_rows = data['test_rows']
-
-    st.markdown('This tab opens the model up: what goes in, what comes out, how it learned, '
-                'and how well it does on orders it never saw.')
-
-    # --- 1. the big picture -------------------------------------------------
-    st.markdown('#### 1 · From factory data to a range of hours')
-    st.graphviz_chart('''
-digraph {
-    rankdir=LR;
-    bgcolor="transparent";
-    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
-          color="#526860", fillcolor="#F4F5F9", margin="0.15,0.08"];
-    edge [color="#7B8794"];
-
-    mes    [label="MES\\nwork orders\\n(the plan)"];
-    scada  [label="SCADA\\nproduction records\\n(what really ran)"];
-    alarms [label="SCADA\\nmachine alarms"];
-
-    features [label="39 inputs at a checkpoint\\nplan · progress so far ·\\narticle & machine history ·\\nalarms · ratios",
-              fillcolor="#E3F4EF", color="#0A926F"];
-
-    p10 [label="model p10\\n(low edge)",  fillcolor="#FFFFFF"];
-    p50 [label="model p50\\n(most likely)", fillcolor="#0A926F", fontcolor="white", color="#076B51"];
-    p90 [label="model p90\\n(high edge)", fillcolor="#FFFFFF"];
-
-    factor [label="correction factor\\n× c", shape=ellipse, fillcolor="#FFFFFF"];
-    answer [label="hours still to come\\n= plan × c\\nwith a p10 – p90 range",
-            fillcolor="#232523", fontcolor="white", color="#232523"];
-
-    mes -> features; scada -> features; alarms -> features;
-    features -> p10; features -> p50; features -> p90;
-    p10 -> factor; p50 -> factor; p90 -> factor;
-    factor -> answer;
-}
-''')
-    st.markdown(
-        '- At a **checkpoint** (0%, 10%, … 90% of the ordered pieces made) the app collects '
-        'everything known *at that moment*, never anything from the future.\n'
-        '- Three tree models read those inputs. They do not predict hours directly: they predict '
-        '**how wrong the plan is**, as a correction factor *c*.\n'
-        '- The answer is the plan\'s remaining hours times *c*. A factor of × 1.00 means the plan '
-        'is right; × 1.20 means 20% more time than planned.')
-
-    # --- 2. why a correction is needed --------------------------------------
-    st.markdown('#### 2 · The plan is usually too optimistic')
-    planned = data['orders_planned']
-    real_cycle = planned['working_seconds'] / planned['goods'].clip(lower=1)
-    plan_ratio = real_cycle / planned['plan_cycle_s']
-    share_slower = float((plan_ratio > 1).mean() * 100)
-
-    figure = go.Figure()
-    figure.add_trace(go.Histogram(x=plan_ratio.clip(upper=3), xbins=dict(start=0, end=3, size=0.1),
-                                  marker=dict(color=PLAN_GREY, line=dict(color='white', width=1)),
-                                  name='orders'))
-    figure.add_vline(x=1, line_color=MODEL_GREEN, line_width=3)
-    figure.add_annotation(x=1, y=1, yref='paper', text=' the plan is exactly right', showarrow=False,
-                          xanchor='left', font=dict(color=GREEN_TEXT))
-    figure.update_layout(
-        height=360, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white', showlegend=False,
-        bargap=0.05,
-        xaxis=dict(title='real time per piece ÷ planned time per piece  (values above 3 shown at 3)',
-                   gridcolor='#E4E7EB'),
-        yaxis=dict(title='number of orders', gridcolor='#E4E7EB'))
-    st.plotly_chart(figure)
-    st.caption('All %d completed orders that had an MES plan. %.0f%% of them needed more time per '
-               'piece than planned (right of the green line). This steady gap is what the model '
-               'learns to correct.' % (len(planned), share_slower))
-
-    # --- 3. what the trees really predict ---------------------------------
     internals = boosting_internals()
     model = internals['model']
-    st.markdown('#### 3 · What the trees really predict: a correction, in logarithms')
-    column_1, column_2 = st.columns([1.3, 1])
-    with column_1:
-        st.markdown(
-            'The trees never see hours. For every training row they learn one number:\n\n'
-            '**target = ln( real hours left ÷ plan hours left )**\n\n'
-            '- 0 means the plan was right (e⁰ = × 1.00)\n'
-            '- +0.18 means 20% more time than planned (e⁰·¹⁸ = × 1.20)\n'
-            '- −0.11 means 10% less (e⁻⁰·¹¹ = × 0.90)\n\n'
-            'Hours only appear at the very end: **plan hours × e^(sum of the trees)**. A model that '
-            'learned nothing would answer 0, which gives the plan back unchanged, so the plan is '
-            'always the starting point.')
-    with column_2:
-        st.markdown('**Why the logarithm?**')
-        st.markdown(
-            'Trees can only **add** numbers, but slowdowns **multiply**. Two slowdowns of 10% '
-            'are not 20%:')
-        st.markdown(
-            '| | |\n|---|---|\n'
-            '| adding the factors | 1.1 + 1.1 = 2.2 ✗ |\n'
-            '| multiplying them | 1.1 × 1.1 = 1.21 ✓ |\n'
-            '| adding the logs | 0.095 + 0.095 = 0.19 |\n'
-            '| back from logs | e⁰·¹⁹ = 1.21 ✓ |')
-        st.caption('Adding in log space is multiplying in real space, so trees that add can '
-                   'model slowdowns that multiply.')
+    test_rows = data['test_rows']
+    n_trees = len(internals['trees'])
 
-    # --- one real test order, followed through the next sections ---------------
+    st.markdown('The model is a chain of **%d small decision trees**, built one after the other. '
+                'This tab opens them up and follows one real test order through them.' % n_trees)
+
+    # --- the order followed through the whole tab -------------------------------
     at_30 = test_rows[test_rows['checkpoint'] == 0.3].sort_values('target_h')
     example_codes = list(at_30['wo_code'])
     # the order shown in the thesis presentation: the plan said 5.18 h, the model 8.03 h
     first_example = len(example_codes) // 2
     if 'WO-0578' in example_codes:
         first_example = example_codes.index('WO-0578')
-    st.markdown('#### 4 · One real decision tree')
     column_1, column_2 = st.columns(2)
     with column_1:
         example_code = st.selectbox(
-            'Follow this test order (at 30% of its pieces) through the trees', example_codes,
+            'Order to follow (a test order, when 30% of its pieces were made)', example_codes,
             index=first_example, key='tree_example',
             format_func=lambda code: '%s  ·  %s' % (
                 code, machine_label(at_30[at_30['wo_code'] == code]['wc_id'].iloc[0])),
-            help='Any test order that reached 30% of its ordered pieces. Its path through the '
-                 'tree is drawn in green.')
-    with column_2:
-        tree_number = st.slider('Tree to draw', min_value=1, max_value=len(internals['trees']),
-                                value=1, key='tree_number',
-                                help='The model has %d trees, built one after the other. Tree 1 '
-                                     'is the first one.' % len(internals['trees']))
+            help='Any test order that reached 30% of its ordered pieces. The model never saw it '
+                 'while learning.')
     position = int(np.flatnonzero((test_rows['wo_code'] == example_code).values &
                                   (test_rows['checkpoint'] == 0.3).values)[0])
     example = test_rows.iloc[position]
+    curve = np.concatenate([[internals['start']], internals['staged'][:, position]])
+    steps = np.diff(curve)
+    plan_left = float(example['mes_remaining_h'])
+    factor = float(np.exp(curve[-1]))
+    truth = float(np.log(max(example['target_h'], 0.05) / max(plan_left, 0.05)))
+
+    # --- 1. the idea --------------------------------------------------------------
+    st.markdown('#### 1 · The idea: the trees correct the plan')
+    st.graphviz_chart('''
+digraph {
+    rankdir=LR; bgcolor="transparent"; nodesep=0.25;
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
+          color="#9AA5B1", fillcolor="#F4F5F9", margin="0.14,0.07"];
+    edge [color="#7B8794"];
+    inputs [label="what is known\\nat this moment\\n(39 inputs)"];
+    start  [label="start\\n%+.3f"];
+    t1     [label="tree 1\\n%+.4f", fillcolor="#E3F4EF", color="#0A926F"];
+    t2     [label="tree 2\\n%+.4f", fillcolor="#E3F4EF", color="#0A926F"];
+    more   [label="…", shape=plaintext, style=""];
+    tn     [label="tree %d\\n%+.4f", fillcolor="#E3F4EF", color="#0A926F"];
+    total  [label="sum %+.3f\\ncorrection × %.2f", fillcolor="#0A926F", fontcolor="white",
+            color="#076B51"];
+    plan   [label="MES plan\\n%.2f h left"];
+    answer [label="%.2f h × %.2f\\n= %.2f h left", fillcolor="#232523", fontcolor="white",
+            color="#232523"];
+    inputs -> t1 [style=dashed]; inputs -> t2 [style=dashed]; inputs -> tn [style=dashed];
+    start -> t1 -> t2 -> more -> tn -> total -> answer;
+    plan -> answer;
+}
+''' % (internals['start'], steps[0], steps[1], n_trees, steps[-1], curve[-1], factor,
+       plan_left, plan_left, factor, plan_left * factor))
+    st.markdown(
+        '- The trees never predict hours. Together they predict **how wrong the plan is**.\n'
+        '- Each tree looks at the inputs and adds one small number. Their sum becomes a '
+        'correction factor: × 1.00 would leave the plan unchanged, × %.2f stretches it.\n'
+        '- The answer is **plan × correction**. For order %s that is %.2f h; in reality '
+        '%.2f h were needed.'
+        % (factor, example_code, plan_left * factor, example['target_h']))
+    st.caption('The p10 – p90 range comes from two more chains of trees, built the same way but '
+               'aiming low and high. Everything on this tab is the middle one (p50).')
+
+    with st.expander('Why a correction, and why the numbers are logarithms'):
+        st.markdown(
+            'What the trees learn for every training row is '
+            '**ln( real hours left ÷ plan hours left )**: 0 means the plan was right, +0.18 '
+            'means 20% more time (e⁰·¹⁸ = × 1.20), −0.11 means 10% less (× 0.90).\n\n'
+            'Trees can only **add** their numbers, but slowdowns **multiply**: two slowdowns of '
+            '10% are 1.1 × 1.1 = 1.21, not 1.1 + 1.1 = 2.2. In logarithms, adding is '
+            'multiplying: ln 1.1 + ln 1.1 = 0.19, and e⁰·¹⁹ = 1.21. So trees that add can model '
+            'slowdowns that multiply.\n\n'
+            'And a model that learned nothing would add up to 0, giving × 1.00: the plan, '
+            'unchanged. The plan is always the starting point.')
+
+    # --- 2. one tree --------------------------------------------------------------
+    st.markdown('#### 2 · One tree: a few yes/no questions')
+    column_1, column_2 = st.columns(2)
+    with column_2:
+        tree_number = st.slider('Tree to look at', min_value=1, max_value=n_trees, value=1,
+                                key='tree_number',
+                                help='Tree 1 is the first one built; each later tree fixes what '
+                                     'the earlier ones still got wrong.')
     tree = internals['trees'][tree_number - 1]
     path = tree_path(tree, internals['encoded'][position])
     st.graphviz_chart(tree_picture(tree, internals, path, whole_tree=False))
+    leaf = tree.nodes[path[-1]]
+    st.markdown(
+        'Order **%s** answers %d questions (the green path) and ends in a **leaf** that adds '
+        '**%+.4f**, that is × %.3f. Orange leaves stretch the plan, blue leaves shrink it. '
+        'Dashed boxes fold up the branches this order does not take; the counts are the training '
+        'rows that reached each box. *empty* shows where a row goes when a value does not exist '
+        'yet, for example the speed so far at 0%%.'
+        % (example_code, len(path) - 1, leaf['value'], np.exp(leaf['value'])))
     with st.expander('Show the whole tree (%d leaves)' % tree.get_n_leaf_nodes()):
         st.graphviz_chart(tree_picture(tree, internals, path, whole_tree=True))
         st.caption('Use the full-screen button at the top right of the drawing to read it.')
-    leaf = tree.nodes[path[-1]]
-    st.markdown(
-        '**How to read it.** Each box asks one question about the row and sends it along the '
-        '*yes* or the *no* arrow; *empty* shows where a row goes when the value does not exist '
-        'yet (for example the speed so far, at 0%%). Each final box (a **leaf**) holds this tree\'s small '
-        'correction: orange leaves stretch the plan, blue ones shrink it. The dashed boxes fold '
-        'up the branches this order does not take. The counts are the training rows that reached '
-        'each box.\n\n'
-        'Order **%s** answers %d questions and lands in the leaf **× %.3f**.'
-        % (example_code, len(path) - 1, np.exp(leaf['value'])))
-    st.caption('This is tree %d of %d of the p50 model, exactly as it was learned: depth up to '
-               '%d, at least %d rows per leaf. Its leaves are tiny because every tree\'s answer '
-               'is multiplied by the learning rate (%.2f), so no single tree decides. %d%% of '
-               'the training rows were held back to decide when to stop, so the root holds %s rows.'
-               % (tree_number, len(internals['trees']), model.max_depth, model.min_samples_leaf,
-                  model.learning_rate, round(model.validation_fraction * 100),
-                  format(int(tree.nodes[0]['count']), ',')))
+    st.caption('Each tree is at most %d questions deep and every leaf rests on at least %d '
+               'training rows, so no tree can learn a single order by heart. Leaves are small '
+               'because each tree\'s answer is multiplied by the learning rate (%.2f): no single '
+               'tree decides.' % (model.max_depth, model.min_samples_leaf, model.learning_rate))
 
-    # --- 5. the trees add up --------------------------------------------------
-    st.markdown('#### 5 · Gradient boosting: the trees add up')
-    curve = np.concatenate([[internals['start']], internals['staged'][:, position]])
-    plan_left = float(example['mes_remaining_h'])
-    truth = float(np.log(max(example['target_h'], 0.05) / max(plan_left, 0.05)))
-    steps = np.diff(curve)
-    shown = 5
-    rest = float(curve[-1] - curve[shown])
-
-    names = ['start'] + ['tree %d' % (k + 1) for k in range(shown)]
-    names += ['trees %d – %d' % (shown + 1, len(steps)), 'sum']
-    values = [internals['start']] + list(steps[:shown]) + [rest, curve[-1]]
-    figure = go.Figure(go.Waterfall(
-        x=names, y=values, measure=['absolute'] + ['relative'] * (shown + 1) + ['total'],
-        text=['%+.3f' % value for value in values], textposition='outside',
-        increasing=dict(marker=dict(color='#E08A1E')), decreasing=dict(marker=dict(color=SPEED_BLUE)),
-        totals=dict(marker=dict(color=MODEL_GREEN)), connector=dict(line=dict(color='#9AA5B1'))))
-    figure.add_hline(y=truth, line_color=REAL_RED, line_dash='dash')
-    figure.add_annotation(x=1, xref='paper', y=truth, text='the truth: %+.3f' % truth,
-                          showarrow=False, yshift=10, xanchor='right', font=dict(color=REAL_RED))
-    figure.update_layout(
-        title='Order %s: each tree adds its leaf to the sum (log units)' % example_code,
-        height=400, margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
-        yaxis=dict(title='ln( correction )', gridcolor='#E4E7EB', zeroline=True,
-                   zerolinecolor='#232523'))
-    st.plotly_chart(figure)
-
-    factor = float(np.exp(curve[-1]))
-    column_1, column_2, column_3, column_4 = st.columns(4)
-    column_1.metric('Sum of all %d trees' % len(steps), '%+.3f' % curve[-1],
-                    help='start + every tree\'s leaf')
-    column_2.metric('Correction = e^sum', '× %.3f' % factor)
-    column_3.metric('Plan × correction', '%.2f h' % (plan_left * factor),
-                    help='The plan said %.2f h.' % plan_left)
-    column_4.metric('What really happened', '%.2f h' % example['target_h'])
-    st.caption('The start (%+.3f) is the median correction of all training rows: the best single '
-               'guess before any tree has looked at the order. Then every tree adds the leaf the '
-               'order lands in. Each tree is trained on what the trees before it still got wrong '
-               'on all the training rows, so together they fit better and better; for one single '
-               'order the sum does not have to land exactly on the truth.' % internals['start'])
-
+    # --- 3. the trees add up --------------------------------------------------------
+    st.markdown('#### 3 · Many trees: each one fixes what is left')
     figure = go.Figure()
     figure.add_trace(go.Scatter(x=list(range(len(curve))), y=np.exp(curve), mode='lines',
                                 line=dict(color=MODEL_GREEN, width=3), name='model after n trees'))
     figure.add_hline(y=np.exp(truth), line_color=REAL_RED, line_dash='dash')
-    figure.add_annotation(x=1, xref='paper', y=np.exp(truth), text='the truth: × %.3f' % np.exp(truth),
+    figure.add_annotation(x=1, xref='paper', y=np.exp(truth), text='the truth: × %.2f' % np.exp(truth),
                           showarrow=False, yshift=10, xanchor='right', font=dict(color=REAL_RED))
     figure.add_hline(y=1, line_color=PLAN_GREY, line_dash='dot')
-    figure.add_annotation(x=0, xref='paper', y=1, text='the plan: × 1.000', showarrow=False,
+    figure.add_annotation(x=0, xref='paper', y=1, text='the plan: × 1.00', showarrow=False,
                           yshift=-12, xanchor='left', font=dict(color=PLAN_GREY))
     figure.update_layout(
-        title='The same order: the correction after 0, 1, 2 … %d trees' % len(steps), height=340,
-        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
+        title='Order %s: the correction after 0, 1, 2 … %d trees' % (example_code, n_trees),
+        height=360, margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
         xaxis=dict(title='number of trees added', gridcolor='#E4E7EB'),
         yaxis=dict(title='correction to the plan (×)', gridcolor='#E4E7EB'))
     st.plotly_chart(figure)
+    st.markdown(
+        'This is **gradient boosting**. It starts from one guess for every order (× %.2f, the '
+        'typical correction in the training data). Tree 1 is trained on the mistakes of that '
+        'guess, tree 2 on the mistakes that are still left, and so on. Adding the trees one by '
+        'one moves the correction step by step; for one single order it does not have to land '
+        'exactly on the truth.' % np.exp(internals['start']))
 
-    # --- 6. how many trees ----------------------------------------------------
-    st.markdown('#### 6 · How many trees, and when to stop')
-    column_1, column_2 = st.columns(2)
+    with st.expander('See the first trees one by one'):
+        shown = 5
+        names = ['start'] + ['tree %d' % (k + 1) for k in range(shown)]
+        names += ['trees %d – %d' % (shown + 1, len(steps)), 'sum']
+        values = ([internals['start']] + list(steps[:shown]) +
+                  [float(curve[-1] - curve[shown]), curve[-1]])
+        figure = go.Figure(go.Waterfall(
+            x=names, y=values, measure=['absolute'] + ['relative'] * (shown + 1) + ['total'],
+            text=['%+.3f' % value for value in values], textposition='outside',
+            increasing=dict(marker=dict(color='#E08A1E')),
+            decreasing=dict(marker=dict(color=SPEED_BLUE)),
+            totals=dict(marker=dict(color=MODEL_GREEN)), connector=dict(line=dict(color='#9AA5B1'))))
+        figure.add_hline(y=truth, line_color=REAL_RED, line_dash='dash')
+        figure.add_annotation(x=1, xref='paper', y=truth, text='the truth: %+.3f' % truth,
+                              showarrow=False, yshift=10, xanchor='right', font=dict(color=REAL_RED))
+        figure.update_layout(
+            height=380, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white',
+            showlegend=False, yaxis=dict(title='sum so far (log units)', gridcolor='#E4E7EB'))
+        st.plotly_chart(figure)
+        st.caption('Each bar is the leaf the order lands in, in one tree. Orange adds, blue '
+                   'subtracts. The correction is e to the power of the sum: e^%.3f = × %.2f.'
+                   % (curve[-1], factor))
+
+    # --- 4. when to stop ------------------------------------------------------------
+    st.markdown('#### 4 · When to stop adding trees')
     train_loss = -np.array(model.train_score_)
     held_back_loss = -np.array(model.validation_score_)
     figure = go.Figure()
@@ -1184,195 +1080,71 @@ digraph {
                                 line=dict(color=SPEED_BLUE, width=2), name='rows it learns from'))
     figure.add_trace(go.Scatter(x=list(range(len(held_back_loss))), y=held_back_loss,
                                 mode='lines', line=dict(color=MODEL_GREEN, width=3),
-                                name='rows held back (%d%%)' % round(model.validation_fraction * 100)))
+                                name='rows kept aside to check (%d%%)'
+                                     % round(model.validation_fraction * 100)))
     figure.add_vline(x=model.n_iter_, line_color='#232523', line_dash='dash')
     figure.add_annotation(x=model.n_iter_, y=1, yref='paper', text='stop: %d trees ' % model.n_iter_,
                           showarrow=False, xanchor='right')
     figure.update_layout(
-        title='Training: error after each tree', height=380, margin=dict(l=10, r=10, t=50, b=10),
-        plot_bgcolor='white',
+        height=340, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white',
         xaxis=dict(title='number of trees', gridcolor='#E4E7EB'),
-        yaxis=dict(title='average error, log units', gridcolor='#E4E7EB'),
-        legend=dict(orientation='h', yanchor='top', y=-0.22, xanchor='left', x=0))
-    column_1.plotly_chart(figure)
-
-    error_by_trees = internals['error_by_trees']
-    figure = go.Figure()
-    figure.add_trace(go.Scatter(x=list(range(1, len(error_by_trees) + 1)), y=error_by_trees,
-                                mode='lines', line=dict(color=MODEL_GREEN, width=3),
-                                name='model with n trees'))
-    figure.add_hline(y=result['mes_error_pct'], line_color=PLAN_GREY, line_dash='dash')
-    figure.add_annotation(x=1, xref='paper', y=result['mes_error_pct'],
-                          text='MES plan: %.1f%%' % result['mes_error_pct'], showarrow=False,
-                          yshift=10, xanchor='right', font=dict(color=PLAN_GREY))
-    figure.update_layout(
-        title='Test orders: error as trees are added', height=380,
-        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
-        xaxis=dict(title='number of trees', gridcolor='#E4E7EB'),
-        yaxis=dict(title='average error, % of the hours really left', gridcolor='#E4E7EB',
-                   rangemode='tozero'))
-    column_2.plotly_chart(figure)
-    st.markdown(
-        'Training could go on up to %d trees. After every tree the model checks its error on '
-        'the rows it held back; once %d trees in a row bring no real gain, it stops. Here it '
-        'stopped at **%d trees**. On the test orders, the start value plus the first tree give '
-        '%.1f%% error; all %d trees together give **%.1f%%**.'
-        % (model.max_iter, model.n_iter_no_change, model.n_iter_, error_by_trees[0],
-           len(error_by_trees), error_by_trees[-1]))
-
-    st.markdown('**One tree, a random forest, or boosting?**')
-    st.dataframe(pd.DataFrame({
-        '': ['trees', 'how they are built', 'each tree learns', 'combined by', 'size of each tree',
-             'main defence against overfitting'],
-        'one decision tree': ['one', '–', 'the answer', '–', 'as deep as needed', 'limit its depth'],
-        'random forest': ['many', 'independently, side by side', 'the whole answer, from random '
-                          'rows and features', 'average', 'usually deep', 'randomness, then averaging'],
-        'gradient boosting (this model)': ['many (%d here)' % model.n_iter_, 'one after the other',
-                                           'only the mistake left so far', 'adding them up',
-                                           'small (depth %d)' % model.max_depth,
-                                           'learning rate and early stopping'],
-    }), hide_index=True)
-
-    # --- 7. how it learned ------------------------------------------------
-    st.markdown('#### 7 · Learning from the past, tested on the future')
-    split_date = pd.Timestamp(meta['split_date'])
-    starts = data['orders_all']['start']
-    week = 7 * 24 * 3600 * 1000
-    figure = go.Figure()
-    figure.add_trace(go.Histogram(x=starts[starts < split_date], xbins=dict(size=week),
-                                  marker=dict(color=SPEED_BLUE), name='used to learn'))
-    figure.add_trace(go.Histogram(x=starts[starts >= split_date], xbins=dict(size=week),
-                                  marker=dict(color=MODEL_GREEN), name='kept hidden for the test'))
-    figure.add_vline(x=split_date, line_color='#232523', line_dash='dash')
-    figure.add_annotation(x=split_date, y=1, yref='paper', text=' split: %s' % meta['split_date'],
-                          showarrow=False, xanchor='left')
-    figure.update_layout(
-        height=320, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white', barmode='overlay',
-        xaxis=dict(title='week the order started', gridcolor='#E4E7EB'),
-        yaxis=dict(title='orders started', gridcolor='#E4E7EB'),
+        yaxis=dict(title='average error (log units)', gridcolor='#E4E7EB'),
         legend=dict(orientation='h', yanchor='top', y=-0.25, xanchor='left', x=0))
     st.plotly_chart(figure)
     st.markdown(
-        'The orders are split **by date**, not at random: the model learns from the older orders '
-        'and is tested only on orders that started after %s. This is how it would be used for '
-        'real, always predicting the future from the past. Every training order is turned into '
-        'one row per checkpoint, which gives %s training rows.'
-        % (meta['split_date'], format(meta['training_rows'], ',')))
-    st.markdown(
-        '**Why three models.** Everything above is the p50 model. The p10 and p90 models are '
-        'built the same way and differ only in what they aim at: **p50** aims at the middle, so '
-        'half of the real values should be above it and half below; **p10** aims low, so only 1 '
-        'real value in 10 is below it; **p90** aims high, so only 1 in 10 is above. Together they '
-        'give the most likely value and a range.')
+        'Too many trees start fixing random noise instead of real patterns. So %d%% of the '
+        'training rows are kept aside: after every tree the model checks its error on them, and '
+        'once %d trees in a row bring no real gain, it stops. It was allowed up to %d trees and '
+        'stopped at **%d**.'
+        % (round(model.validation_fraction * 100), model.n_iter_no_change, model.max_iter,
+           model.n_iter_))
 
-    # --- 8. what the model looks at -------------------------------------------
-    st.markdown('#### 8 · What the model looks at')
-    importance = feature_importance()
-    top = importance.head(12).iloc[::-1]
-    figure = go.Figure()
-    for name, colour, features in FEATURE_GROUPS:
-        part = top[top['group'] == name]
-        if len(part) == 0:
-            continue
-        figure.add_trace(go.Bar(x=part['growth_pct'], y=part['feature'], orientation='h',
-                                marker=dict(color=colour), name=name))
+    # --- 5. what the trees ask about ---------------------------------------------------
+    st.markdown('#### 5 · What the trees ask about most')
+    asked = sorted(internals['questions'].items(), key=lambda item: item[1])[-12:]
+    labels = []
+    counts = []
+    for feature, count in asked:
+        labels.append('%s  (%s)' % (FEATURE_WORDS.get(feature, feature), feature))
+        counts.append(count)
+    figure = go.Figure(go.Bar(x=counts, y=labels, orientation='h',
+                              marker=dict(color=MODEL_GREEN), text=counts, textposition='outside'))
     figure.update_layout(
-        height=440, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white', barmode='stack',
-        xaxis=dict(title='how much the error grows when this input is scrambled (%)',
-                   gridcolor='#E4E7EB'),
-        yaxis=dict(categoryorder='array', categoryarray=list(top['feature'])),
-        legend=dict(orientation='h', yanchor='top', y=-0.2, xanchor='left', x=0))
+        height=420, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white',
+        xaxis=dict(title='questions asked, in all %d trees' % n_trees, gridcolor='#E4E7EB',
+                   range=[0, max(counts) * 1.2]))
     st.plotly_chart(figure)
-    st.caption('The 12 most useful of the 39 inputs, for the p50 model on the test orders. Each '
-               'input is shuffled in turn, breaking its link with the truth; the more the error '
-               'grows, the more the model relies on it.')
+    st.caption('The 12 inputs the trees ask about most often. An input asked about often is one '
+               'the model finds useful for splitting the orders into groups that behave alike.')
 
-    with st.expander('All 39 inputs, by group'):
-        for name, colour, features in FEATURE_GROUPS:
-            st.markdown('<span style="color:%s">■</span> **%s**: %s'
-                        % (colour, name, ', '.join('`%s`' % f for f in features)),
-                        unsafe_allow_html=True)
-
-    # --- 9. how well it does --------------------------------------------------
-    st.markdown('#### 9 · How well it does on orders it never saw')
-    column_1, column_2 = st.columns(2)
-    # zoomed on 98% of the points, so a few very long orders do not squeeze the rest
-    widest = float(test_rows['target_h'].quantile(0.98)) * 1.1
-    for column, values, colour, title in [
-            (column_1, test_rows['mes_remaining_h'], PLAN_GREY, 'MES plan'),
-            (column_2, test_rows['ml_pred_h'], MODEL_GREEN, 'Model (p50)')]:
-        figure = go.Figure()
-        longest = float(max(test_rows['target_h'].max(), values.max())) * 1.05
-        figure.add_trace(go.Scatter(x=[0, longest], y=[0, longest], mode='lines',
-                                    line=dict(color='#232523', dash='dash', width=1),
-                                    name='perfect', hoverinfo='skip'))
-        figure.add_trace(go.Scatter(x=test_rows['target_h'], y=values, mode='markers',
-                                    marker=dict(color=colour, size=6, opacity=0.55),
-                                    name=title, text=test_rows['wo_code'],
-                                    hovertemplate='%{text}<br>real %{x:.2f} h<br>said %{y:.2f} h'
-                                                  '<extra></extra>'))
-        figure.update_layout(
-            title=title, height=400, margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white',
-            showlegend=False,
-            xaxis=dict(title='hours really left', range=[0, widest], gridcolor='#E4E7EB'),
-            yaxis=dict(title='hours predicted', range=[0, widest], gridcolor='#E4E7EB'))
-        column.plotly_chart(figure)
-    st.caption('Each dot is one test prediction. On the dashed line the prediction is perfect. '
-               'The plan\'s dots sit mostly below the line: it expects too little time. The '
-               'model\'s dots sit closer to the line. The view skips the few longest orders; '
-               'double-click a chart to see them all.')
-
-    per_checkpoint = []
-    for checkpoint in CHECKPOINTS:
-        rows_here = test_rows[test_rows['checkpoint'] == checkpoint]
-        if len(rows_here) == 0:
-            continue
-        denominator = rows_here['target_h'].clip(lower=0.5)
-        inside = ((rows_here['target_h'] >= rows_here['ml_p10_h']) &
-                  (rows_here['target_h'] <= rows_here['ml_p90_h']))
-        per_checkpoint.append({
-            'checkpoint': '%d%%' % round(checkpoint * 100),
-            'plan': float(((rows_here['mes_remaining_h'] - rows_here['target_h']).abs()
-                           / denominator * 100).mean()),
-            'model': float(((rows_here['ml_pred_h'] - rows_here['target_h']).abs()
-                            / denominator * 100).mean()),
-            'inside': float(inside.mean() * 100),
-        })
-    per_checkpoint = pd.DataFrame(per_checkpoint)
-
-    column_1, column_2 = st.columns(2)
-    figure = go.Figure()
-    figure.add_trace(go.Bar(x=per_checkpoint['checkpoint'], y=per_checkpoint['plan'],
-                            marker=dict(color=PLAN_GREY), name='MES plan'))
-    figure.add_trace(go.Bar(x=per_checkpoint['checkpoint'], y=per_checkpoint['model'],
-                            marker=dict(color=MODEL_GREEN), name='model'))
-    figure.update_layout(
-        title='Average error at each checkpoint', height=380, barmode='group',
-        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white',
-        xaxis=dict(title='share of the ordered pieces already made', type='category'),
-        yaxis=dict(title='error, % of the hours really left', gridcolor='#E4E7EB'),
-        legend=dict(orientation='h', yanchor='top', y=-0.22, xanchor='left', x=0))
-    column_1.plotly_chart(figure)
-
-    figure = go.Figure()
-    figure.add_trace(go.Bar(x=per_checkpoint['checkpoint'], y=per_checkpoint['inside'],
-                            marker=dict(color=BAND, line=dict(color=MODEL_GREEN, width=1.5)),
-                            name='real value inside p10 – p90'))
-    figure.add_hline(y=80, line_color='#232523', line_dash='dash')
-    figure.add_annotation(x=0, xref='paper', y=80, text='target 80%', showarrow=False,
-                          yshift=10, xanchor='left')
-    figure.update_layout(
-        title='How often the real value falls inside the range', height=380,
-        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
-        xaxis=dict(title='share of the ordered pieces already made', type='category'),
-        yaxis=dict(title='% of test predictions', range=[0, 100], gridcolor='#E4E7EB'))
-    column_2.plotly_chart(figure)
+    # --- 6. why trees ------------------------------------------------------------------
+    st.markdown('#### 6 · Why trees suit this problem')
     st.markdown(
-        'Overall the model cuts the average error from **%.1f%%** to **%.1f%%** and is closer than '
-        'the plan on **%.1f%%** of the test predictions. The range holds the real value **%.1f%%** '
-        'of the time, a little below the 80%% it aims at, so it is slightly too narrow.'
-        % (result['mes_error_pct'], result['ml_error_pct'], result['win_rate'],
-           result['range_coverage']))
+        '- **Empty values are fine.** At 0%% the speed so far does not exist yet; each question '
+        'learns which way to send an empty value, instead of us inventing one.\n'
+        '- **Units do not matter.** Pieces are in thousands, cycle times in seconds; a tree only '
+        'asks "above or below this value?".\n'
+        '- **Works with little data.** %s training rows is far too few for a neural network, '
+        'but normal for boosted trees.\n'
+        '- **Handles categories.** The machine is a name, not a quantity; one question can group '
+        'any set of machines.\n'
+        '- **Not thrown off by extreme orders.** The trees are trained on the absolute error, so '
+        'the few orders that ran several times slower than planned do not dominate.'
+        % format(meta['training_rows'], ','))
+    with st.expander('One tree, a random forest, or gradient boosting?'):
+        st.dataframe(pd.DataFrame({
+            '': ['trees', 'how they are built', 'each tree learns', 'combined by',
+                 'size of each tree', 'defence against overfitting'],
+            'one decision tree': ['one', '–', 'the answer', '–', 'as deep as needed',
+                                  'limit its depth'],
+            'random forest': ['many', 'independently, side by side',
+                              'the whole answer, from random rows and features', 'average',
+                              'usually deep', 'randomness, then averaging'],
+            'gradient boosting (this model)': ['%d' % n_trees, 'one after the other',
+                                               'only the mistake left so far', 'adding them up',
+                                               'small (depth %d)' % model.max_depth,
+                                               'learning rate and early stopping'],
+        }), hide_index=True)
 
 
 # ---------------------------------------------------------------------
