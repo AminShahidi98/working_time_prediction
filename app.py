@@ -755,6 +755,188 @@ FEATURE_GROUPS = [
 ]
 
 
+FEATURE_WORDS = {
+    'ordered_qty': 'pieces ordered', 'plan_work_h': 'planned working hours',
+    'plan_cycle_s': 'planned seconds per piece', 'plan_setup_h': 'planned setup hours',
+    'priority': 'order priority', 'pct_of_ordered': 'share of ordered pieces made',
+    'pieces_done': 'pieces made so far', 'remaining_pieces': 'pieces still to make',
+    'worked_h': 'machine hours so far', 'obs_cycle_s': 'seconds per piece so far',
+    'elapsed_wall_h': 'clock hours since the start',
+    'wall_work_frac': 'share of the clock spent working', 'waste_rate': 'waste per piece',
+    'dow': 'day of the week', 'hour': 'hour of the day',
+    'art_n_past': 'past orders of the article', 'art_cycle_s': 'article: past seconds per piece',
+    'art_med_work_h': 'article: typical order hours', 'art_plan_bias': 'article: past real ÷ plan',
+    'mach_n_past': 'past orders on the machine', 'mach_cycle_s': 'machine: past seconds per piece',
+    'mach_med_work_h': 'machine: typical order hours', 'mach_plan_bias': 'machine: past real ÷ plan',
+    'alarms_7d': 'alarms, last 7 days', 'alarm_h_7d': 'alarm hours, last 7 days',
+    'alarms_30d': 'alarms, last 30 days', 'alarm_h_30d': 'alarm hours, last 30 days',
+    'obs_vs_plan': 'time per piece so far ÷ plan',
+    'obs_vs_art': 'time per piece so far ÷ article\'s past',
+    'obs_vs_mach': 'time per piece so far ÷ machine\'s past',
+    'plan_vs_art': 'planned time per piece ÷ article\'s past',
+    'plan_vs_mach': 'planned time per piece ÷ machine\'s past',
+    'est_from_obs_h': 'hours left at the speed so far',
+    'est_from_art_h': 'hours left at the article\'s past speed',
+    'est_from_mach_h': 'hours left at the machine\'s past speed',
+    'est_plan_x_mach_bias': 'plan × machine\'s past real ÷ plan',
+    'est_plan_x_art_bias': 'plan × article\'s past real ÷ plan',
+    'mes_remaining_h': 'plan: hours left', 'wc_id': 'machine',
+}
+
+
+@st.cache_resource(show_spinner='Opening up the trees...')
+def boosting_internals():
+    """What the p50 model is made of, read from the fitted model.
+
+    These are scikit-learn internals (version pinned in requirements.txt):
+    the trees are in _predictors, the starting value in _baseline_prediction
+    and the column order the trees use in _preprocessor.
+    """
+    model = data['models']['p50']
+    test_rows = data['test_rows']
+    X = test_rows[FEATURES]
+
+    # the trees see the categorical column (the machine) first, then the others
+    tree_columns = []
+    for feature, is_category in zip(FEATURES, model.is_categorical_):
+        if is_category:
+            tree_columns.append(feature)
+    for feature, is_category in zip(FEATURES, model.is_categorical_):
+        if not is_category:
+            tree_columns.append(feature)
+
+    # the log-correction after 1, 2, ... all trees, for every test row
+    staged = np.array(list(model.staged_predict(X)))
+    plan = test_rows['mes_remaining_h'].clip(lower=0.05).values
+    denominator = test_rows['target_h'].clip(lower=0.5).values
+    error_by_trees = []
+    for stage in staged:
+        hours = plan * np.exp(stage)
+        error_by_trees.append(float(np.mean(np.abs(hours - test_rows['target_h'].values)
+                                            / denominator) * 100))
+
+    return {
+        'model': model,
+        'trees': [tree[0] for tree in model._predictors],
+        'start': float(model._baseline_prediction.ravel()[0]),
+        'tree_columns': tree_columns,
+        'machines': list(model._preprocessor.named_transformers_['encoder'].categories_[0]),
+        'encoded': model._preprocessor.transform(X),
+        'staged': staged,
+        'error_by_trees': error_by_trees,
+        'can_be_empty': set(feature for feature in FEATURES if X[feature].isna().any()),
+    }
+
+
+def tree_path(tree, values):
+    """The nodes one row visits in one tree, from the root to its leaf."""
+    nodes = tree.nodes
+    node = 0
+    path = [0]
+    while not nodes[node]['is_leaf']:
+        split = nodes[node]
+        value = values[split['feature_idx']]
+        if np.isnan(value):
+            go_left = bool(split['missing_go_to_left'])
+        elif split['is_categorical']:
+            bits = tree.raw_left_cat_bitsets[split['bitset_idx']]
+            code = int(value)
+            go_left = bool((bits[code // 32] >> (code % 32)) & 1)
+        else:
+            go_left = value <= split['num_threshold']
+        if go_left:
+            node = int(split['left'])
+        else:
+            node = int(split['right'])
+        path.append(node)
+    return path
+
+
+def leaves_below(nodes, index):
+    """The leaves under one node of a tree."""
+    if nodes[index]['is_leaf']:
+        return [index]
+    return (leaves_below(nodes, int(nodes[index]['left'])) +
+            leaves_below(nodes, int(nodes[index]['right'])))
+
+
+def tree_picture(tree, internals, path, whole_tree):
+    """One tree as a Graphviz drawing, with the path of one row in green.
+
+    Unless whole_tree is set, every branch the row does not take is folded
+    into one grey box, so the drawing stays small enough to read.
+    """
+    nodes = tree.nodes
+    on_path = set(path)
+    # the folded view is a narrow column, so it reads best top to bottom
+    direction = 'LR' if whole_tree else 'TB'
+    lines = ['digraph {', 'rankdir=%s; bgcolor="transparent"; nodesep=0.3; ranksep=0.35;' % direction,
+             'node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, '
+             'margin="0.14,0.06"];', 'edge [fontname="Helvetica", fontsize=10, color="#9AA5B1"];']
+    for index in range(len(nodes)):
+        node = nodes[index]
+        if not whole_tree and index not in on_path:
+            parent_on_path = False
+            for parent in path:
+                if not nodes[parent]['is_leaf'] and index in (nodes[parent]['left'],
+                                                               nodes[parent]['right']):
+                    parent_on_path = True
+            if not parent_on_path:
+                continue
+            if not node['is_leaf']:
+                folded = leaves_below(nodes, index)
+                factors = np.exp(nodes[folded]['value'])
+                lines.append('n%d [label="%d more leaves\\n× %.3f … × %.3f\\n%d rows", '
+                             'fillcolor="#FFFFFF", color="#C8CDD3", fontcolor="#7B8794", '
+                             'style="rounded,filled,dashed"];'
+                             % (index, len(folded), factors.min(), factors.max(), node['count']))
+                continue
+        if node['is_leaf']:
+            factor = np.exp(node['value'])
+            fill = '#FDEBD3' if factor >= 1 else '#DCE9F5'
+            label = '× %.3f\\n%d rows' % (factor, node['count'])
+            border = '#037A51' if index in on_path else '#9AA5B1'
+            width = 3 if index in on_path else 1
+            lines.append('n%d [label="%s", fillcolor="%s", color="%s", penwidth=%d];'
+                         % (index, label, fill, border, width))
+            continue
+        feature = internals['tree_columns'][node['feature_idx']]
+        if node['is_categorical']:
+            bits = tree.raw_left_cat_bitsets[node['bitset_idx']]
+            left_machines = []
+            for code in range(len(internals['machines'])):
+                if (bits[code // 32] >> (code % 32)) & 1:
+                    left_machines.append(str(int(internals['machines'][code])))
+            question = 'machine one of\\n%s ?' % ', '.join(left_machines)
+        else:
+            question = '%s\\n≤ %s ?' % (FEATURE_WORDS.get(feature, feature),
+                                        '%.3g' % node['num_threshold'])
+        label = '%s\\n%d rows' % (question, node['count'])
+        if index in on_path:
+            lines.append('n%d [label="%s", fillcolor="#04CF88", fontcolor="white", '
+                         'color="#037A51"];' % (index, label))
+        else:
+            lines.append('n%d [label="%s", fillcolor="#F4F5F9", color="#9AA5B1"];'
+                         % (index, label))
+        yes_label = 'yes'
+        no_label = 'no'
+        if feature in internals['can_be_empty']:
+            if node['missing_go_to_left']:
+                yes_label = 'yes / empty'
+            else:
+                no_label = 'no / empty'
+        for child, text in [(node['left'], yes_label), (node['right'], no_label)]:
+            if not whole_tree and index not in on_path:
+                continue
+            if index in on_path and child in on_path:
+                style = 'color="#04CF88", penwidth=3, fontcolor="#037A51"'
+            else:
+                style = ''
+            lines.append('n%d -> n%d [label=" %s", %s];' % (index, child, text, style))
+    lines.append('}')
+    return '\n'.join(lines)
+
+
 def group_of(feature):
     for name, colour, features in FEATURE_GROUPS:
         if feature in features:
@@ -857,8 +1039,202 @@ digraph {
                'piece than planned (right of the green line). This steady gap is what the model '
                'learns to correct.' % (len(planned), share_slower))
 
-    # --- 3. how it learned ------------------------------------------------
-    st.markdown('#### 3 · Learning from the past, tested on the future')
+    # --- 3. what the trees really predict ---------------------------------
+    internals = boosting_internals()
+    model = internals['model']
+    st.markdown('#### 3 · What the trees really predict: a correction, in logarithms')
+    column_1, column_2 = st.columns([1.3, 1])
+    with column_1:
+        st.markdown(
+            'The trees never see hours. For every training row they learn one number:\n\n'
+            '**target = ln( real hours left ÷ plan hours left )**\n\n'
+            '- 0 means the plan was right (e⁰ = × 1.00)\n'
+            '- +0.18 means 20% more time than planned (e⁰·¹⁸ = × 1.20)\n'
+            '- −0.11 means 10% less (e⁻⁰·¹¹ = × 0.90)\n\n'
+            'Hours only appear at the very end: **plan hours × e^(sum of the trees)**. A model that '
+            'learned nothing would answer 0, which gives the plan back unchanged, so the plan is '
+            'always the starting point.')
+    with column_2:
+        st.markdown('**Why the logarithm?**')
+        st.markdown(
+            'Trees can only **add** numbers, but slowdowns **multiply**. Two slowdowns of 10% '
+            'are not 20%:')
+        st.markdown(
+            '| | |\n|---|---|\n'
+            '| adding the factors | 1.1 + 1.1 = 2.2 ✗ |\n'
+            '| multiplying them | 1.1 × 1.1 = 1.21 ✓ |\n'
+            '| adding the logs | 0.095 + 0.095 = 0.19 |\n'
+            '| back from logs | e⁰·¹⁹ = 1.21 ✓ |')
+        st.caption('Adding in log space is multiplying in real space, so trees that add can '
+                   'model slowdowns that multiply.')
+
+    # --- one real test order, followed through the next sections ---------------
+    at_30 = test_rows[test_rows['checkpoint'] == 0.3].sort_values('target_h')
+    example_codes = list(at_30['wo_code'])
+    # the order shown in the thesis presentation: the plan said 5.18 h, the model 8.03 h
+    first_example = len(example_codes) // 2
+    if 'WO-0578' in example_codes:
+        first_example = example_codes.index('WO-0578')
+    st.markdown('#### 4 · One real decision tree')
+    column_1, column_2 = st.columns(2)
+    with column_1:
+        example_code = st.selectbox(
+            'Follow this test order (at 30% of its pieces) through the trees', example_codes,
+            index=first_example, key='tree_example',
+            format_func=lambda code: '%s  ·  %s' % (
+                code, machine_label(at_30[at_30['wo_code'] == code]['wc_id'].iloc[0])),
+            help='Any test order that reached 30% of its ordered pieces. Its path through the '
+                 'tree is drawn in green.')
+    with column_2:
+        tree_number = st.slider('Tree to draw', min_value=1, max_value=len(internals['trees']),
+                                value=1, key='tree_number',
+                                help='The model has %d trees, built one after the other. Tree 1 '
+                                     'is the first one.' % len(internals['trees']))
+    position = int(np.flatnonzero((test_rows['wo_code'] == example_code).values &
+                                  (test_rows['checkpoint'] == 0.3).values)[0])
+    example = test_rows.iloc[position]
+    tree = internals['trees'][tree_number - 1]
+    path = tree_path(tree, internals['encoded'][position])
+    st.graphviz_chart(tree_picture(tree, internals, path, whole_tree=False))
+    with st.expander('Show the whole tree (%d leaves)' % tree.get_n_leaf_nodes()):
+        st.graphviz_chart(tree_picture(tree, internals, path, whole_tree=True))
+        st.caption('Use the full-screen button at the top right of the drawing to read it.')
+    leaf = tree.nodes[path[-1]]
+    st.markdown(
+        '**How to read it.** Each box asks one question about the row and sends it along the '
+        '*yes* or the *no* arrow; *empty* shows where a row goes when the value does not exist '
+        'yet (for example the speed so far, at 0%%). Each final box (a **leaf**) holds this tree\'s small '
+        'correction: orange leaves stretch the plan, blue ones shrink it. The dashed boxes fold '
+        'up the branches this order does not take. The counts are the training rows that reached '
+        'each box.\n\n'
+        'Order **%s** answers %d questions and lands in the leaf **× %.3f**.'
+        % (example_code, len(path) - 1, np.exp(leaf['value'])))
+    st.caption('This is tree %d of %d of the p50 model, exactly as it was learned: depth up to '
+               '%d, at least %d rows per leaf. Its leaves are tiny because every tree\'s answer '
+               'is multiplied by the learning rate (%.2f), so no single tree decides. %d%% of '
+               'the training rows were held back to decide when to stop, so the root holds %s rows.'
+               % (tree_number, len(internals['trees']), model.max_depth, model.min_samples_leaf,
+                  model.learning_rate, round(model.validation_fraction * 100),
+                  format(int(tree.nodes[0]['count']), ',')))
+
+    # --- 5. the trees add up --------------------------------------------------
+    st.markdown('#### 5 · Gradient boosting: the trees add up')
+    curve = np.concatenate([[internals['start']], internals['staged'][:, position]])
+    plan_left = float(example['mes_remaining_h'])
+    truth = float(np.log(max(example['target_h'], 0.05) / max(plan_left, 0.05)))
+    steps = np.diff(curve)
+    shown = 5
+    rest = float(curve[-1] - curve[shown])
+
+    names = ['start'] + ['tree %d' % (k + 1) for k in range(shown)]
+    names += ['trees %d – %d' % (shown + 1, len(steps)), 'sum']
+    values = [internals['start']] + list(steps[:shown]) + [rest, curve[-1]]
+    figure = go.Figure(go.Waterfall(
+        x=names, y=values, measure=['absolute'] + ['relative'] * (shown + 1) + ['total'],
+        text=['%+.3f' % value for value in values], textposition='outside',
+        increasing=dict(marker=dict(color='#E08A1E')), decreasing=dict(marker=dict(color=SPEED_BLUE)),
+        totals=dict(marker=dict(color=MODEL_GREEN)), connector=dict(line=dict(color='#9AA5B1'))))
+    figure.add_hline(y=truth, line_color=REAL_RED, line_dash='dash')
+    figure.add_annotation(x=1, xref='paper', y=truth, text='the truth: %+.3f' % truth,
+                          showarrow=False, yshift=10, xanchor='right', font=dict(color=REAL_RED))
+    figure.update_layout(
+        title='Order %s: each tree adds its leaf to the sum (log units)' % example_code,
+        height=400, margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
+        yaxis=dict(title='ln( correction )', gridcolor='#E4E7EB', zeroline=True,
+                   zerolinecolor='#232523'))
+    st.plotly_chart(figure)
+
+    factor = float(np.exp(curve[-1]))
+    column_1, column_2, column_3, column_4 = st.columns(4)
+    column_1.metric('Sum of all %d trees' % len(steps), '%+.3f' % curve[-1],
+                    help='start + every tree\'s leaf')
+    column_2.metric('Correction = e^sum', '× %.3f' % factor)
+    column_3.metric('Plan × correction', '%.2f h' % (plan_left * factor),
+                    help='The plan said %.2f h.' % plan_left)
+    column_4.metric('What really happened', '%.2f h' % example['target_h'])
+    st.caption('The start (%+.3f) is the median correction of all training rows: the best single '
+               'guess before any tree has looked at the order. Then every tree adds the leaf the '
+               'order lands in. Each tree is trained on what the trees before it still got wrong '
+               'on all the training rows, so together they fit better and better; for one single '
+               'order the sum does not have to land exactly on the truth.' % internals['start'])
+
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=list(range(len(curve))), y=np.exp(curve), mode='lines',
+                                line=dict(color=MODEL_GREEN, width=3), name='model after n trees'))
+    figure.add_hline(y=np.exp(truth), line_color=REAL_RED, line_dash='dash')
+    figure.add_annotation(x=1, xref='paper', y=np.exp(truth), text='the truth: × %.3f' % np.exp(truth),
+                          showarrow=False, yshift=10, xanchor='right', font=dict(color=REAL_RED))
+    figure.add_hline(y=1, line_color=PLAN_GREY, line_dash='dot')
+    figure.add_annotation(x=0, xref='paper', y=1, text='the plan: × 1.000', showarrow=False,
+                          yshift=-12, xanchor='left', font=dict(color=PLAN_GREY))
+    figure.update_layout(
+        title='The same order: the correction after 0, 1, 2 … %d trees' % len(steps), height=340,
+        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
+        xaxis=dict(title='number of trees added', gridcolor='#E4E7EB'),
+        yaxis=dict(title='correction to the plan (×)', gridcolor='#E4E7EB'))
+    st.plotly_chart(figure)
+
+    # --- 6. how many trees ----------------------------------------------------
+    st.markdown('#### 6 · How many trees, and when to stop')
+    column_1, column_2 = st.columns(2)
+    train_loss = -np.array(model.train_score_)
+    held_back_loss = -np.array(model.validation_score_)
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=list(range(len(train_loss))), y=train_loss, mode='lines',
+                                line=dict(color=SPEED_BLUE, width=2), name='rows it learns from'))
+    figure.add_trace(go.Scatter(x=list(range(len(held_back_loss))), y=held_back_loss,
+                                mode='lines', line=dict(color=MODEL_GREEN, width=3),
+                                name='rows held back (%d%%)' % round(model.validation_fraction * 100)))
+    figure.add_vline(x=model.n_iter_, line_color='#232523', line_dash='dash')
+    figure.add_annotation(x=model.n_iter_, y=1, yref='paper', text='stop: %d trees ' % model.n_iter_,
+                          showarrow=False, xanchor='right')
+    figure.update_layout(
+        title='Training: error after each tree', height=380, margin=dict(l=10, r=10, t=50, b=10),
+        plot_bgcolor='white',
+        xaxis=dict(title='number of trees', gridcolor='#E4E7EB'),
+        yaxis=dict(title='average error, log units', gridcolor='#E4E7EB'),
+        legend=dict(orientation='h', yanchor='top', y=-0.22, xanchor='left', x=0))
+    column_1.plotly_chart(figure)
+
+    error_by_trees = internals['error_by_trees']
+    figure = go.Figure()
+    figure.add_trace(go.Scatter(x=list(range(1, len(error_by_trees) + 1)), y=error_by_trees,
+                                mode='lines', line=dict(color=MODEL_GREEN, width=3),
+                                name='model with n trees'))
+    figure.add_hline(y=result['mes_error_pct'], line_color=PLAN_GREY, line_dash='dash')
+    figure.add_annotation(x=1, xref='paper', y=result['mes_error_pct'],
+                          text='MES plan: %.1f%%' % result['mes_error_pct'], showarrow=False,
+                          yshift=10, xanchor='right', font=dict(color=PLAN_GREY))
+    figure.update_layout(
+        title='Test orders: error as trees are added', height=380,
+        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
+        xaxis=dict(title='number of trees', gridcolor='#E4E7EB'),
+        yaxis=dict(title='average error, % of the hours really left', gridcolor='#E4E7EB',
+                   rangemode='tozero'))
+    column_2.plotly_chart(figure)
+    st.markdown(
+        'Training could go on up to %d trees. After every tree the model checks its error on '
+        'the rows it held back; once %d trees in a row bring no real gain, it stops. Here it '
+        'stopped at **%d trees**. On the test orders, the start value plus the first tree give '
+        '%.1f%% error; all %d trees together give **%.1f%%**.'
+        % (model.max_iter, model.n_iter_no_change, model.n_iter_, error_by_trees[0],
+           len(error_by_trees), error_by_trees[-1]))
+
+    st.markdown('**One tree, a random forest, or boosting?**')
+    st.dataframe(pd.DataFrame({
+        '': ['trees', 'how they are built', 'each tree learns', 'combined by', 'size of each tree',
+             'main defence against overfitting'],
+        'one decision tree': ['one', '–', 'the answer', '–', 'as deep as needed', 'limit its depth'],
+        'random forest': ['many', 'independently, side by side', 'the whole answer, from random '
+                          'rows and features', 'average', 'usually deep', 'randomness, then averaging'],
+        'gradient boosting (this model)': ['many (%d here)' % model.n_iter_, 'one after the other',
+                                           'only the mistake left so far', 'adding them up',
+                                           'small (depth %d)' % model.max_depth,
+                                           'learning rate and early stopping'],
+    }), hide_index=True)
+
+    # --- 7. how it learned ------------------------------------------------
+    st.markdown('#### 7 · Learning from the past, tested on the future')
     split_date = pd.Timestamp(meta['split_date'])
     starts = data['orders_all']['start']
     week = 7 * 24 * 3600 * 1000
@@ -882,45 +1258,15 @@ digraph {
         'real, always predicting the future from the past. Every training order is turned into '
         'one row per checkpoint, which gives %s training rows.'
         % (meta['split_date'], format(meta['training_rows'], ',')))
+    st.markdown(
+        '**Why three models.** Everything above is the p50 model. The p10 and p90 models are '
+        'built the same way and differ only in what they aim at: **p50** aims at the middle, so '
+        'half of the real values should be above it and half below; **p10** aims low, so only 1 '
+        'real value in 10 is below it; **p90** aims high, so only 1 in 10 is above. Together they '
+        'give the most likely value and a range.')
 
-    column_1, column_2 = st.columns(2)
-    with column_1:
-        st.markdown('**What one model is**')
-        st.markdown(
-            'A *gradient-boosted* model is a long chain of small decision trees. Each tree asks a '
-            'few yes/no questions, such as *"is the order running slower than planned?"* or '
-            '*"did this article overrun in the past?"*, and adds a small correction. Each new tree '
-            'fixes part of the mistakes the earlier ones still make.')
-    with column_2:
-        st.markdown('**Why three models**')
-        st.markdown(
-            'The three models are identical except for what they aim at. **p50** aims at the '
-            'middle: half of the real values should be above it, half below. **p10** aims low, so '
-            'only 1 real value in 10 is below it. **p90** aims high, so only 1 in 10 is above. '
-            'Together they give the most likely value and a range.')
-
-    # --- 4. one prediction, step by step -------------------------------------
-    st.markdown('#### 4 · One prediction, step by step')
-    at_30 = test_rows[test_rows['checkpoint'] == 0.3].sort_values('target_h').reset_index(drop=True)
-    example = at_30.iloc[len(at_30) // 2]
-    factor = example['ml_pred_h'] / max(example['mes_remaining_h'], 0.05)
-    st.markdown('A real test order, **%s** on machine **%s**, when 30%% of its pieces were made:'
-                % (example['wo_code'], machine_label(example['wc_id'])))
-    column_1, column_2, column_3, column_4 = st.columns(4)
-    column_1.metric('1 · The plan says', '%.2f h' % example['mes_remaining_h'])
-    if pd.notna(example['obs_vs_plan']):
-        column_2.metric('2 · Speed so far vs plan', '× %.2f' % example['obs_vs_plan'],
-                        help='Real seconds per piece so far ÷ planned seconds per piece.')
-    column_3.metric('3 · Model\'s correction', '× %.2f' % factor)
-    column_4.metric('4 · Answer', '%.2f h' % example['ml_pred_h'],
-                    help='Range p10 – p90: %.2f – %.2f h' % (example['ml_p10_h'], example['ml_p90_h']))
-    st.markdown('%.2f h × %.2f = **%.2f h**, with a range of %.2f – %.2f h. What really happened: '
-                '**%.2f h** were still needed.' % (
-                    example['mes_remaining_h'], factor, example['ml_pred_h'],
-                    example['ml_p10_h'], example['ml_p90_h'], example['target_h']))
-
-    # --- 5. what the model looks at -------------------------------------------
-    st.markdown('#### 5 · What the model looks at')
+    # --- 8. what the model looks at -------------------------------------------
+    st.markdown('#### 8 · What the model looks at')
     importance = feature_importance()
     top = importance.head(12).iloc[::-1]
     figure = go.Figure()
@@ -947,8 +1293,8 @@ digraph {
                         % (colour, name, ', '.join('`%s`' % f for f in features)),
                         unsafe_allow_html=True)
 
-    # --- 6. how well it does --------------------------------------------------
-    st.markdown('#### 6 · How well it does on orders it never saw')
+    # --- 9. how well it does --------------------------------------------------
+    st.markdown('#### 9 · How well it does on orders it never saw')
     column_1, column_2 = st.columns(2)
     # zoomed on 98% of the points, so a few very long orders do not squeeze the rest
     widest = float(test_rows['target_h'].quantile(0.98)) * 1.1
