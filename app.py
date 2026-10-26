@@ -13,7 +13,10 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from predictor import CHECKPOINTS, History, build_live_row, predict_range, train_models
+from sklearn.inspection import permutation_importance
+
+from predictor import (CHECKPOINTS, FEATURES, History, build_live_row, predict_range,
+                       train_models)
 
 ARTIFACTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'artifacts')
 
@@ -381,8 +384,9 @@ def history_expander(row):
 # =====================================================================
 st.title('How much working time does this order still need?')
 
-tab_running, tab_plan, tab_real, tab_about = st.tabs([
-    'Order in progress', 'Plan a new order', 'Real orders (test period)', 'How it works'])
+tab_running, tab_plan, tab_real, tab_model, tab_about = st.tabs([
+    'Order in progress', 'Plan a new order', 'Real orders (test period)', 'Inside the model',
+    'How it works'])
 
 
 # ---------------------------------------------------------------------
@@ -729,7 +733,304 @@ with tab_real:
 
 
 # ---------------------------------------------------------------------
-# tab 4: how it works
+# tab 4: inside the model
+# ---------------------------------------------------------------------
+FEATURE_GROUPS = [
+    ('The MES plan', '#526860',
+     ['ordered_qty', 'plan_work_h', 'plan_cycle_s', 'plan_setup_h', 'priority',
+      'mes_remaining_h']),
+    ('Progress so far', '#04CF88',
+     ['pct_of_ordered', 'pieces_done', 'remaining_pieces', 'worked_h', 'obs_cycle_s',
+      'elapsed_wall_h', 'wall_work_frac', 'waste_rate']),
+    ('Day and hour', '#9AA5B1', ['dow', 'hour']),
+    ('Article history', '#E08A1E',
+     ['art_n_past', 'art_cycle_s', 'art_med_work_h', 'art_plan_bias']),
+    ('Machine history', '#2E6DA4',
+     ['mach_n_past', 'mach_cycle_s', 'mach_med_work_h', 'mach_plan_bias', 'wc_id']),
+    ('Alarms', '#C0392B', ['alarms_7d', 'alarm_h_7d', 'alarms_30d', 'alarm_h_30d']),
+    ('Comparisons and ready-made estimates', '#8E5BB5',
+     ['obs_vs_plan', 'obs_vs_art', 'obs_vs_mach', 'plan_vs_art', 'plan_vs_mach',
+      'est_from_obs_h', 'est_from_art_h', 'est_from_mach_h',
+      'est_plan_x_mach_bias', 'est_plan_x_art_bias']),
+]
+
+
+def group_of(feature):
+    for name, colour, features in FEATURE_GROUPS:
+        if feature in features:
+            return name, colour
+    return 'other', '#9AA5B1'
+
+
+@st.cache_resource(show_spinner='Measuring which inputs matter most...')
+def feature_importance():
+    """Permutation importance of the p50 model on the test rows.
+
+    Each input is shuffled in turn; the more the error grows, the more the
+    model relies on that input.
+    """
+    test_rows = data['test_rows']
+    plan = test_rows['mes_remaining_h'].clip(lower=0.05)
+    real = test_rows['target_h'].clip(lower=0.05)
+    target = np.log(real / plan)
+    model = data['models']['p50']
+    baseline = float(np.mean(np.abs(model.predict(test_rows[FEATURES]) - target)))
+    shuffled = permutation_importance(model, test_rows[FEATURES], target,
+                                      scoring='neg_mean_absolute_error',
+                                      n_repeats=5, random_state=42)
+    rows = []
+    for index, feature in enumerate(FEATURES):
+        group, colour = group_of(feature)
+        rows.append({'feature': feature, 'group': group, 'colour': colour,
+                     'growth_pct': shuffled.importances_mean[index] / baseline * 100})
+    return pd.DataFrame(rows).sort_values('growth_pct', ascending=False)
+
+
+with tab_model:
+    result = meta['result']
+    test_rows = data['test_rows']
+
+    st.markdown('This tab opens the model up: what goes in, what comes out, how it learned, '
+                'and how well it does on orders it never saw.')
+
+    # --- 1. the big picture -------------------------------------------------
+    st.markdown('#### 1 · From factory data to a range of hours')
+    st.graphviz_chart('''
+digraph {
+    rankdir=LR;
+    bgcolor="transparent";
+    node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11,
+          color="#526860", fillcolor="#F4F5F9", margin="0.15,0.08"];
+    edge [color="#7B8794"];
+
+    mes    [label="MES\\nwork orders\\n(the plan)"];
+    scada  [label="SCADA\\nproduction records\\n(what really ran)"];
+    alarms [label="SCADA\\nmachine alarms"];
+
+    features [label="39 inputs at a checkpoint\\nplan · progress so far ·\\narticle & machine history ·\\nalarms · ratios",
+              fillcolor="#E6FAF3", color="#04CF88"];
+
+    p10 [label="model p10\\n(low edge)",  fillcolor="#FFFFFF"];
+    p50 [label="model p50\\n(most likely)", fillcolor="#04CF88", fontcolor="white", color="#037A51"];
+    p90 [label="model p90\\n(high edge)", fillcolor="#FFFFFF"];
+
+    factor [label="correction factor\\n× c", shape=ellipse, fillcolor="#FFFFFF"];
+    answer [label="hours still to come\\n= plan × c\\nwith a p10 – p90 range",
+            fillcolor="#232523", fontcolor="white", color="#232523"];
+
+    mes -> features; scada -> features; alarms -> features;
+    features -> p10; features -> p50; features -> p90;
+    p10 -> factor; p50 -> factor; p90 -> factor;
+    factor -> answer;
+}
+''')
+    st.markdown(
+        '- At a **checkpoint** (0%, 10%, … 90% of the ordered pieces made) the app collects '
+        'everything known *at that moment*, never anything from the future.\n'
+        '- Three tree models read those inputs. They do not predict hours directly: they predict '
+        '**how wrong the plan is**, as a correction factor *c*.\n'
+        '- The answer is the plan\'s remaining hours times *c*. A factor of × 1.00 means the plan '
+        'is right; × 1.20 means 20% more time than planned.')
+
+    # --- 2. why a correction is needed --------------------------------------
+    st.markdown('#### 2 · The plan is usually too optimistic')
+    planned = data['orders_planned']
+    real_cycle = planned['working_seconds'] / planned['goods'].clip(lower=1)
+    plan_ratio = real_cycle / planned['plan_cycle_s']
+    share_slower = float((plan_ratio > 1).mean() * 100)
+
+    figure = go.Figure()
+    figure.add_trace(go.Histogram(x=plan_ratio.clip(upper=3), xbins=dict(start=0, end=3, size=0.1),
+                                  marker=dict(color=PLAN_GREY, line=dict(color='white', width=1)),
+                                  name='orders'))
+    figure.add_vline(x=1, line_color=MODEL_GREEN, line_width=3)
+    figure.add_annotation(x=1, y=1, yref='paper', text=' the plan is exactly right', showarrow=False,
+                          xanchor='left', font=dict(color=GREEN_TEXT))
+    figure.update_layout(
+        height=360, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white', showlegend=False,
+        bargap=0.05,
+        xaxis=dict(title='real time per piece ÷ planned time per piece  (values above 3 shown at 3)',
+                   gridcolor='#E4E7EB'),
+        yaxis=dict(title='number of orders', gridcolor='#E4E7EB'))
+    st.plotly_chart(figure)
+    st.caption('All %d completed orders that had an MES plan. %.0f%% of them needed more time per '
+               'piece than planned (right of the green line). This steady gap is what the model '
+               'learns to correct.' % (len(planned), share_slower))
+
+    # --- 3. how it learned ------------------------------------------------
+    st.markdown('#### 3 · Learning from the past, tested on the future')
+    split_date = pd.Timestamp(meta['split_date'])
+    starts = data['orders_all']['start']
+    week = 7 * 24 * 3600 * 1000
+    figure = go.Figure()
+    figure.add_trace(go.Histogram(x=starts[starts < split_date], xbins=dict(size=week),
+                                  marker=dict(color=SPEED_BLUE), name='used to learn'))
+    figure.add_trace(go.Histogram(x=starts[starts >= split_date], xbins=dict(size=week),
+                                  marker=dict(color=MODEL_GREEN), name='kept hidden for the test'))
+    figure.add_vline(x=split_date, line_color='#232523', line_dash='dash')
+    figure.add_annotation(x=split_date, y=1, yref='paper', text=' split: %s' % meta['split_date'],
+                          showarrow=False, xanchor='left')
+    figure.update_layout(
+        height=320, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white', barmode='overlay',
+        xaxis=dict(title='week the order started', gridcolor='#E4E7EB'),
+        yaxis=dict(title='orders started', gridcolor='#E4E7EB'),
+        legend=dict(orientation='h', yanchor='top', y=-0.25, xanchor='left', x=0))
+    st.plotly_chart(figure)
+    st.markdown(
+        'The orders are split **by date**, not at random: the model learns from the older orders '
+        'and is tested only on orders that started after %s. This is how it would be used for '
+        'real, always predicting the future from the past. Every training order is turned into '
+        'one row per checkpoint, which gives %s training rows.'
+        % (meta['split_date'], format(meta['training_rows'], ',')))
+
+    column_1, column_2 = st.columns(2)
+    with column_1:
+        st.markdown('**What one model is**')
+        st.markdown(
+            'A *gradient-boosted* model is a long chain of small decision trees. Each tree asks a '
+            'few yes/no questions, such as *"is the order running slower than planned?"* or '
+            '*"did this article overrun in the past?"*, and adds a small correction. Each new tree '
+            'fixes part of the mistakes the earlier ones still make.')
+    with column_2:
+        st.markdown('**Why three models**')
+        st.markdown(
+            'The three models are identical except for what they aim at. **p50** aims at the '
+            'middle: half of the real values should be above it, half below. **p10** aims low, so '
+            'only 1 real value in 10 is below it. **p90** aims high, so only 1 in 10 is above. '
+            'Together they give the most likely value and a range.')
+
+    # --- 4. one prediction, step by step -------------------------------------
+    st.markdown('#### 4 · One prediction, step by step')
+    at_30 = test_rows[test_rows['checkpoint'] == 0.3].sort_values('target_h').reset_index(drop=True)
+    example = at_30.iloc[len(at_30) // 2]
+    factor = example['ml_pred_h'] / max(example['mes_remaining_h'], 0.05)
+    st.markdown('A real test order, **%s** on machine **%s**, when 30%% of its pieces were made:'
+                % (example['wo_code'], machine_label(example['wc_id'])))
+    column_1, column_2, column_3, column_4 = st.columns(4)
+    column_1.metric('1 · The plan says', '%.2f h' % example['mes_remaining_h'])
+    if pd.notna(example['obs_vs_plan']):
+        column_2.metric('2 · Speed so far vs plan', '× %.2f' % example['obs_vs_plan'],
+                        help='Real seconds per piece so far ÷ planned seconds per piece.')
+    column_3.metric('3 · Model\'s correction', '× %.2f' % factor)
+    column_4.metric('4 · Answer', '%.2f h' % example['ml_pred_h'],
+                    help='Range p10 – p90: %.2f – %.2f h' % (example['ml_p10_h'], example['ml_p90_h']))
+    st.markdown('%.2f h × %.2f = **%.2f h**, with a range of %.2f – %.2f h. What really happened: '
+                '**%.2f h** were still needed.' % (
+                    example['mes_remaining_h'], factor, example['ml_pred_h'],
+                    example['ml_p10_h'], example['ml_p90_h'], example['target_h']))
+
+    # --- 5. what the model looks at -------------------------------------------
+    st.markdown('#### 5 · What the model looks at')
+    importance = feature_importance()
+    top = importance.head(12).iloc[::-1]
+    figure = go.Figure()
+    for name, colour, features in FEATURE_GROUPS:
+        part = top[top['group'] == name]
+        if len(part) == 0:
+            continue
+        figure.add_trace(go.Bar(x=part['growth_pct'], y=part['feature'], orientation='h',
+                                marker=dict(color=colour), name=name))
+    figure.update_layout(
+        height=440, margin=dict(l=10, r=10, t=20, b=10), plot_bgcolor='white', barmode='stack',
+        xaxis=dict(title='how much the error grows when this input is scrambled (%)',
+                   gridcolor='#E4E7EB'),
+        yaxis=dict(categoryorder='array', categoryarray=list(top['feature'])),
+        legend=dict(orientation='h', yanchor='top', y=-0.2, xanchor='left', x=0))
+    st.plotly_chart(figure)
+    st.caption('The 12 most useful of the 39 inputs, for the p50 model on the test orders. Each '
+               'input is shuffled in turn, breaking its link with the truth; the more the error '
+               'grows, the more the model relies on it.')
+
+    with st.expander('All 39 inputs, by group'):
+        for name, colour, features in FEATURE_GROUPS:
+            st.markdown('<span style="color:%s">■</span> **%s**: %s'
+                        % (colour, name, ', '.join('`%s`' % f for f in features)),
+                        unsafe_allow_html=True)
+
+    # --- 6. how well it does --------------------------------------------------
+    st.markdown('#### 6 · How well it does on orders it never saw')
+    column_1, column_2 = st.columns(2)
+    # zoomed on 98% of the points, so a few very long orders do not squeeze the rest
+    widest = float(test_rows['target_h'].quantile(0.98)) * 1.1
+    for column, values, colour, title in [
+            (column_1, test_rows['mes_remaining_h'], PLAN_GREY, 'MES plan'),
+            (column_2, test_rows['ml_pred_h'], MODEL_GREEN, 'Model (p50)')]:
+        figure = go.Figure()
+        longest = float(max(test_rows['target_h'].max(), values.max())) * 1.05
+        figure.add_trace(go.Scatter(x=[0, longest], y=[0, longest], mode='lines',
+                                    line=dict(color='#232523', dash='dash', width=1),
+                                    name='perfect', hoverinfo='skip'))
+        figure.add_trace(go.Scatter(x=test_rows['target_h'], y=values, mode='markers',
+                                    marker=dict(color=colour, size=6, opacity=0.55),
+                                    name=title, text=test_rows['wo_code'],
+                                    hovertemplate='%{text}<br>real %{x:.2f} h<br>said %{y:.2f} h'
+                                                  '<extra></extra>'))
+        figure.update_layout(
+            title=title, height=400, margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white',
+            showlegend=False,
+            xaxis=dict(title='hours really left', range=[0, widest], gridcolor='#E4E7EB'),
+            yaxis=dict(title='hours predicted', range=[0, widest], gridcolor='#E4E7EB'))
+        column.plotly_chart(figure)
+    st.caption('Each dot is one test prediction. On the dashed line the prediction is perfect. '
+               'The plan\'s dots sit mostly below the line: it expects too little time. The '
+               'model\'s dots sit closer to the line. The view skips the few longest orders; '
+               'double-click a chart to see them all.')
+
+    per_checkpoint = []
+    for checkpoint in CHECKPOINTS:
+        rows_here = test_rows[test_rows['checkpoint'] == checkpoint]
+        if len(rows_here) == 0:
+            continue
+        denominator = rows_here['target_h'].clip(lower=0.5)
+        inside = ((rows_here['target_h'] >= rows_here['ml_p10_h']) &
+                  (rows_here['target_h'] <= rows_here['ml_p90_h']))
+        per_checkpoint.append({
+            'checkpoint': '%d%%' % round(checkpoint * 100),
+            'plan': float(((rows_here['mes_remaining_h'] - rows_here['target_h']).abs()
+                           / denominator * 100).mean()),
+            'model': float(((rows_here['ml_pred_h'] - rows_here['target_h']).abs()
+                            / denominator * 100).mean()),
+            'inside': float(inside.mean() * 100),
+        })
+    per_checkpoint = pd.DataFrame(per_checkpoint)
+
+    column_1, column_2 = st.columns(2)
+    figure = go.Figure()
+    figure.add_trace(go.Bar(x=per_checkpoint['checkpoint'], y=per_checkpoint['plan'],
+                            marker=dict(color=PLAN_GREY), name='MES plan'))
+    figure.add_trace(go.Bar(x=per_checkpoint['checkpoint'], y=per_checkpoint['model'],
+                            marker=dict(color=MODEL_GREEN), name='model'))
+    figure.update_layout(
+        title='Average error at each checkpoint', height=380, barmode='group',
+        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white',
+        xaxis=dict(title='share of the ordered pieces already made', type='category'),
+        yaxis=dict(title='error, % of the hours really left', gridcolor='#E4E7EB'),
+        legend=dict(orientation='h', yanchor='top', y=-0.22, xanchor='left', x=0))
+    column_1.plotly_chart(figure)
+
+    figure = go.Figure()
+    figure.add_trace(go.Bar(x=per_checkpoint['checkpoint'], y=per_checkpoint['inside'],
+                            marker=dict(color=BAND, line=dict(color=MODEL_GREEN, width=1.5)),
+                            name='real value inside p10 – p90'))
+    figure.add_hline(y=80, line_color='#232523', line_dash='dash')
+    figure.add_annotation(x=0, xref='paper', y=80, text='target 80%', showarrow=False,
+                          yshift=10, xanchor='left')
+    figure.update_layout(
+        title='How often the real value falls inside the range', height=380,
+        margin=dict(l=10, r=10, t=50, b=10), plot_bgcolor='white', showlegend=False,
+        xaxis=dict(title='share of the ordered pieces already made', type='category'),
+        yaxis=dict(title='% of test predictions', range=[0, 100], gridcolor='#E4E7EB'))
+    column_2.plotly_chart(figure)
+    st.markdown(
+        'Overall the model cuts the average error from **%.1f%%** to **%.1f%%** and is closer than '
+        'the plan on **%.1f%%** of the test predictions. The range holds the real value **%.1f%%** '
+        'of the time, a little below the 80%% it aims at, so it is slightly too narrow.'
+        % (result['mes_error_pct'], result['ml_error_pct'], result['win_rate'],
+           result['range_coverage']))
+
+
+# ---------------------------------------------------------------------
+# tab 5: how it works
 # ---------------------------------------------------------------------
 with tab_about:
     result = meta['result']
