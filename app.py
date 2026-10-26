@@ -24,13 +24,13 @@ ARTIFACTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'artifacts'
 # answered 500 when it served the local files itself.
 ASSETS = 'https://raw.githubusercontent.com/AminShahidi98/working_time_prediction/main/assets/'
 
-# Quindi palette (QuindiTheme in ProRob.ProNetManager.Edge)
-MODEL_GREEN = '#04CF88'
-GREEN_TEXT = '#037A51'      # the same green, dark enough to read as text on white
+# GBTwin palette: the green of the logo, with Quindi greys
+MODEL_GREEN = '#0A926F'
+GREEN_TEXT = '#076B51'      # the same green, dark enough to read as text on white
 PLAN_GREY = '#526860'
 REAL_RED = '#C0392B'
 SPEED_BLUE = '#2E6DA4'
-BAND = 'rgba(4, 207, 136, 0.18)'
+BAND = 'rgba(10, 146, 111, 0.18)'
 
 st.set_page_config(page_title='Remaining working time · Quindi',
                    page_icon=ASSETS + 'gbtwin_icon.png', layout='wide')
@@ -739,7 +739,7 @@ FEATURE_GROUPS = [
     ('The MES plan', '#526860',
      ['ordered_qty', 'plan_work_h', 'plan_cycle_s', 'plan_setup_h', 'priority',
       'mes_remaining_h']),
-    ('Progress so far', '#04CF88',
+    ('Progress so far', '#0A926F',
      ['pct_of_ordered', 'pieces_done', 'remaining_pieces', 'worked_h', 'obs_cycle_s',
       'elapsed_wall_h', 'wall_work_frac', 'waste_rate']),
     ('Day and hour', '#9AA5B1', ['dow', 'hour']),
@@ -895,7 +895,7 @@ def tree_picture(tree, internals, path, whole_tree):
             factor = np.exp(node['value'])
             fill = '#FDEBD3' if factor >= 1 else '#DCE9F5'
             label = '× %.3f\\n%d rows' % (factor, node['count'])
-            border = '#037A51' if index in on_path else '#9AA5B1'
+            border = '#076B51' if index in on_path else '#9AA5B1'
             width = 3 if index in on_path else 1
             lines.append('n%d [label="%s", fillcolor="%s", color="%s", penwidth=%d];'
                          % (index, label, fill, border, width))
@@ -913,8 +913,8 @@ def tree_picture(tree, internals, path, whole_tree):
                                         '%.3g' % node['num_threshold'])
         label = '%s\\n%d rows' % (question, node['count'])
         if index in on_path:
-            lines.append('n%d [label="%s", fillcolor="#04CF88", fontcolor="white", '
-                         'color="#037A51"];' % (index, label))
+            lines.append('n%d [label="%s", fillcolor="#0A926F", fontcolor="white", '
+                         'color="#076B51"];' % (index, label))
         else:
             lines.append('n%d [label="%s", fillcolor="#F4F5F9", color="#9AA5B1"];'
                          % (index, label))
@@ -929,7 +929,7 @@ def tree_picture(tree, internals, path, whole_tree):
             if not whole_tree and index not in on_path:
                 continue
             if index in on_path and child in on_path:
-                style = 'color="#04CF88", penwidth=3, fontcolor="#037A51"'
+                style = 'color="#0A926F", penwidth=3, fontcolor="#076B51"'
             else:
                 style = ''
             lines.append('n%d -> n%d [label=" %s", %s];' % (index, child, text, style))
@@ -990,10 +990,10 @@ digraph {
     alarms [label="SCADA\\nmachine alarms"];
 
     features [label="39 inputs at a checkpoint\\nplan · progress so far ·\\narticle & machine history ·\\nalarms · ratios",
-              fillcolor="#E6FAF3", color="#04CF88"];
+              fillcolor="#E3F4EF", color="#0A926F"];
 
     p10 [label="model p10\\n(low edge)",  fillcolor="#FFFFFF"];
-    p50 [label="model p50\\n(most likely)", fillcolor="#04CF88", fontcolor="white", color="#037A51"];
+    p50 [label="model p50\\n(most likely)", fillcolor="#0A926F", fontcolor="white", color="#076B51"];
     p90 [label="model p90\\n(high edge)", fillcolor="#FFFFFF"];
 
     factor [label="correction factor\\n× c", shape=ellipse, fillcolor="#FFFFFF"];
