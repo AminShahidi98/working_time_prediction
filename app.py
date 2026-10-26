@@ -922,8 +922,13 @@ with tab_model:
     test_rows = data['test_rows']
     n_trees = len(internals['trees'])
 
-    st.markdown('The model is a chain of **%d small decision trees**, built one after the other. '
-                'This tab opens them up and follows one real test order through them.' % n_trees)
+    st.markdown('### The model: Gradient Boosting Decision Trees (GBDT)')
+    st.markdown(
+        'The model is a **gradient-boosted decision tree regressor**: scikit-learn\'s '
+        '`HistGradientBoostingRegressor`. It is a chain of **%d small decision trees**, built one '
+        'after the other, where each new tree learns to fix the mistakes the trees before it '
+        'still make. This is what *gradient boosting* means. This tab opens the trees up and '
+        'follows one real test order through them.' % n_trees)
 
     # --- the order followed through the whole tab -------------------------------
     at_30 = test_rows[test_rows['checkpoint'] == 0.3].sort_values('target_h')
